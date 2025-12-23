@@ -21,38 +21,53 @@
 
 #define DEBUG_ENABLE
 #define SERIAL_TOGGLE_ENABLE
-#define DYNAMIC_THRESHOLD_ENABLE
 
 #ifdef ARDUINO_ARCH_ESP32
-  int THRESHOLD = 2500;                             // 12 bit adc 0-4095
   constexpr int AUDIO_PIN = 15;
 #else
-  int THRESHOLD = 500;                              // 10 bit adc 0-1023
   constexpr int AUDIO_PIN = A0;
 #endif
 
-constexpr int TIME_WINDOW = 2000;                   // time window to detect multiple claps (ms)
-//constexpr int LED_PIN = 1;
+constexpr int TIME_WINDOW =             2000;       // time window to detect multiple claps (ms)
+constexpr int CLAP_DEBOUNCE =           30;         // time for a clap to fade (ms)
+constexpr float PERCENT_ABOVE_AVERAGE = 30/100.0f;  // threshold percentage above ema
+constexpr double ALPHA =                0.0000833;  // smoothing factor for ema                 
+double ema =                            0.0f;       // ~ one second of ema at 12kHz sample rate
 IRsend irsend;
 
-unsigned long clapBegin = millis();
-bool clapDetected = false;
-bool ledToggle = false;
-int clapCount = 0;
+unsigned long clapBegin =               millis();
+bool clapDetected =                     false;
+bool ledToggle =                        false;
+int clapCount =                         0;
+long accumulator =                      0;
 
 #ifdef DEBUG_ENABLE
-// audio print timer for debugging
-// for now, every 200ms
-constexpr int PRINT_INTERVAL = 200;           // in ms
-unsigned long lastPrint = millis();
+constexpr int PRINT_INTERVAL =          200;           // in ms
+constexpr int COUNT_INTERVAL =          10000;         // in ms
+unsigned long lastPrint =               clapBegin;
+unsigned long lastCountPrint =          clapBegin;
+unsigned long cycles =                  0;
 #endif
 
 // put function declarations here:
 
+void EMAInit() {
+  //set ema to real average
+  uint64_t total = 0;
+  constexpr int SAMPLES = 10000;
+
+  for (int i = 0; i < SAMPLES; i++)
+  {
+    total += analogRead(AUDIO_PIN);
+  }
+  ema = total / (double)SAMPLES;
+}
+
 void turnOnFan() {
   uint16_t fanAddress = 0xFF00;
-  uint32_t power =    0x15;
-  uint32_t timer =    0x09;
+  uint32_t power =      0x15;
+  uint32_t timer =      0x09;
+
   irsend.sendNEC(fanAddress, power, 0);
   delay(200);
   irsend.sendNEC(fanAddress, timer, 0);
@@ -72,78 +87,69 @@ void setup() {
   //pinMode(LED_PIN, OUTPUT);
   irsend.begin();
   Serial.begin(115200);
-
+  EMAInit();
 }
 
 void loop() {
 
+  uint16_t sensorValue = analogRead(AUDIO_PIN);
+  uint16_t originalValue = sensorValue;
+  
+  ema += ALPHA * (sensorValue - ema);                       // exponential moving average
+  const int THRESHOLD = ema * (1 + PERCENT_ABOVE_AVERAGE);  // dynamic threshold based on ema
+
   #ifdef DEBUG_ENABLE
-  if (millis() - lastPrint > PRINT_INTERVAL) {                // print analog audio strength every PRINT_INTERVAL ms
-    lastPrint = millis();
-    uint16_t sensorValue = analogRead(AUDIO_PIN);
+  unsigned long currentTime = millis();
+  cycles++;
+  if (currentTime - lastCountPrint > COUNT_INTERVAL) {                // print cycles every COUNT_INTERVAL ms
+    lastCountPrint = currentTime;
+    Serial.print("Cycles in last ");
+    Serial.print(COUNT_INTERVAL/1000);
+    Serial.print(" seconds: ");
+    Serial.println(cycles);
+    cycles = 0;
+  }
+  if (currentTime - lastPrint > PRINT_INTERVAL) {                // print analog audio strength every PRINT_INTERVAL ms
+    lastPrint = currentTime;
     Serial.print("Audio Pin Value: ");
     Serial.println(sensorValue);
+    Serial.print("EMA: ");
+    Serial.println(ema);
   }
   #endif
 
-  #ifdef DYNAMIC_THRESHOLD_ENABLE
-  if (Serial.available()){                                    // dynamic threshold changing
+  #ifdef SERIAL_TOGGLE_ENABLE
+  if (Serial.available())
+  {
     String command = Serial.readStringUntil('\n');
-
-    #ifdef SERIAL_TOGGLE_ENABLE
     if (command == "q") {
       toggle();
     } 
-    else {
-      int newThreshold = command.toInt();
-      if (newThreshold > 0 && newThreshold <= 4095){
-        Serial.print("Setting new threshold to: ");
-        Serial.println(newThreshold);
-        THRESHOLD = newThreshold;
-      }
-    }
-    #else
-    
-    int newThreshold = command.toInt();
-    //TODO: change 4095 to be platform specific
-    #ifdef ARDUINO_ARCH_ESP32
-      if (newThreshold > 0 && newThreshold <= 4095){
-    #else
-      if (newThreshold > 0 && newThreshold <= 1023){
-    #endif
-        Serial.print("Setting new threshold to: ");
-        Serial.println(newThreshold);
-        THRESHOLD = newThreshold;
-      }
-    }
-    #endif
   }
   #endif
 
 
-  uint16_t sensorValue = analogRead(AUDIO_PIN);
-  uint16_t originalValue = sensorValue;
-  if (!clapDetected){
-
-    if (sensorValue > THRESHOLD){
+  if (!clapDetected)
+  {
+    if (sensorValue > THRESHOLD) // possible clap detected
+    {
       clapBegin = millis();
-      clapDetected = true;
-      clapCount++;
       
-      delay(100);
+      delay(CLAP_DEBOUNCE);
       sensorValue = analogRead(AUDIO_PIN);
       if (sensorValue > THRESHOLD){                 // sound source is not a clap
         clapDetected = false;
         clapCount = 0;
       }
       else {
-        Serial.println("Clap detected!");
+        clapDetected = true;
+        clapCount++;
         #ifdef DEBUG_ENABLE
+        Serial.println("Clap detected!");
         Serial.println(originalValue);
         #endif
       }
     }
-
   }
   // read for 2s to see 
   // if continuous sound or if there are dips.
@@ -154,24 +160,25 @@ void loop() {
       int originalValue = sensorValue;
       if (sensorValue > THRESHOLD){
         
-        clapCount++;
-        delay(100);
+        delay(CLAP_DEBOUNCE);
         sensorValue = analogRead(AUDIO_PIN);
-
         if (sensorValue > THRESHOLD){                 // clap debounce
           clapDetected = false;
           clapCount = 0;
         }
-        #ifdef DEBUG_ENABLE
         else {
+          clapCount++;
+          #ifdef DEBUG_ENABLE
           Serial.println(originalValue);
+          #endif
         }
-        #endif
       }
     }
     else {
+      #ifdef DEBUG_ENABLE
       Serial.print("Total claps detected: ");
       Serial.println(clapCount);
+      #endif
       clapDetected = false;
       
       if (clapCount > 1) {
